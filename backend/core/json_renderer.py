@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from PIL import Image, ImageDraw, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 from .config import (
     SCREEN_WIDTH, SCREEN_HEIGHT,
@@ -23,8 +23,6 @@ from .patterns.utils import (
     EINK_BG,
     EINK_FG,
     apply_text_fontmode,
-    draw_status_bar,
-    draw_footer,
     draw_dashed_line,
     load_font,
     load_font_by_name,
@@ -1263,50 +1261,11 @@ def render_json_mode(
         layout = _merge_layout_dict(layout, overrides[size_key])
     layout = expand_layout_presets(layout)
 
-    sb = layout.get("status_bar", {})
-    ft_layout = layout.get("footer", {})
-    status_bar_pct = 0.10 if screen_h < 200 else 0.12
-    # 296×128：旧 draw_status_bar 横线在 int(h*0.11)（约 14px）；若用 int(h*0.10)+2 与之相同，视觉上“没下移”
-    if screen_h <= 128:
-        status_bar_bottom = int(screen_h * 0.11) + 2
-    else:
-        status_bar_bottom = int(screen_h * status_bar_pct)
-
-    _dsb_kw: dict[str, Any] = dict(
-        draw=draw,
-        img=img,
-        date_str=date_str,
-        weather_str=weather_str,
-        battery_pct=int(battery_pct),
-        weather_code=weather_code,
-        line_width=sb.get("line_width", 1),
-        dashed=sb.get("dashed", False),
-        time_str=time_str,
-        screen_w=screen_w,
-        screen_h=screen_h,
-        colors=colors,
-        language=language,
-    )
-    if screen_h <= 128:
-        _dsb_kw["separator_y"] = status_bar_bottom
-    draw_status_bar(**_dsb_kw)
-
-    scale = screen_w / 400.0
-    if scale < 0.92:
-        scale = 0.92
-    min_scale = min(scale, screen_h / 300.0)
-    if min_scale < 0.65:
-        min_scale = 0.65
-    footer_height = int(ft_layout.get("height", 30) * min_scale)
-    # 2.9"（128px 高等）：页脚要容纳图标 + 左右文案，缩放后仍须足够高度，否则会贴底
-    if screen_h <= 128:
-        footer_height = max(footer_height, 24)
-    footer_top = screen_h - footer_height
-    # 页脚顶部分隔线相对「内容上边界」下移 2–3px，与 draw_footer(y_line) 一致
+    # Status bar and footer are not part of the screen image.
+    status_bar_bottom = 0
+    footer_height = 0
+    footer_top = screen_h
     footer_top_offset = 0
-    if screen_h <= 128:
-        footer_top_offset = 3
-        footer_top += footer_top_offset
 
     body = layout.get("body", [])
     if _uses_component_tree(body, layout):
@@ -1378,26 +1337,6 @@ def render_json_mode(
                 _render_block(ctx, block)
 
     _apply_decorations(img, layout.get("decorations", []), screen_w, screen_h, status_bar_bottom)
-
-    ft = ft_layout
-    mode_id = mode_def.get("mode_id", "")
-    label = _localized_footer_label(mode_id, ft.get("label", mode_id), language)
-    attribution = ctx.resolve(ft.get("attribution_template", "")) if ft.get("attribution_template") else ""
-    attribution = _localized_footer_attribution(mode_id, attribution, language)
-    _attr_font_size = ft.get("font_size")
-    if _attr_font_size is not None:
-        _attr_font_size = int(_attr_font_size * scale)
-    draw_footer(
-        draw, img, label, attribution,
-        mode_id=mode_id,
-        weather_code=content.get("today_code", content.get("code")),
-        line_width=ft.get("line_width", 1),
-        dashed=ft.get("dashed", False),
-        attr_font_size=_attr_font_size,
-        screen_w=screen_w, screen_h=screen_h,
-        colors=colors,
-        footer_top=footer_top,
-    )
 
     return img
 
@@ -2537,65 +2476,65 @@ def _draw_image_placeholder(ctx: RenderContext, x: int, y: int, width: int, heig
     ctx.draw.text((tx, ty), text, fill=EINK_FG, font=placeholder_font)
 
 
+def _image_block_box(ctx: RenderContext, block: dict, src: Image.Image | None = None) -> tuple[int, int, int, int]:
+    """Return x, y, width, height. Portrait sources flip a landscape box when it still fits."""
+    width = int(block.get("width", 220) * ctx.scale)
+    height = int(block.get("height", 140) * ctx.scale)
+    if src is not None and block.get("match_orientation"):
+        oriented = ImageOps.exif_transpose(src)
+        src_w, src_h = oriented.size
+        if src_w > 0 and src_h > 0 and (src_h > src_w) != (height > width):
+            swapped_w, swapped_h = height, width
+            if swapped_w <= ctx.screen_w and swapped_h <= ctx.screen_h:
+                width, height = swapped_w, swapped_h
+    x = int(block["x"]) if "x" in block else (ctx.screen_w - width) // 2
+    y = int(block["y"]) if "y" in block else ctx.y
+    return x, y, width, height
+
+
+def _paste_image_block(ctx: RenderContext, block: dict, src: Image.Image) -> None:
+    x, y, width, height = _image_block_box(ctx, block, src)
+    fit = str(block.get("fit", "fill") or "fill")
+    img = convert_image_block(
+        src,
+        width,
+        height,
+        ctx.colors,
+        fit=fit,
+        align_x=str(block.get("align_x", "center") or "center"),
+        align_y=str(block.get("align_y", "center") or "center"),
+        photo_enhance=bool(block.get("photo_enhance", False)),
+    )
+    if ctx.colors >= 3:
+        ctx.img.paste(img, (x, y))
+    else:
+        ctx.paste_icon(img, (x, y))
+    ctx.y = y + height + int(block.get("margin_bottom", 6) * ctx.scale)
+
+
 def _render_image(ctx: RenderContext, block: dict) -> None:
     field_name = block.get("field", "image_url")
     image_url = str(ctx.get_field(field_name) or "")
     if not image_url:
         return
-    width = int(block.get("width", 220) * ctx.scale)
-    height = int(block.get("height", 140) * ctx.scale)
-    x = int(block.get("x", (ctx.screen_w - width) // 2))
-    y = int(block.get("y", ctx.y))
-    fit = str(block.get("fit", "fill") or "fill")
-    align_x = str(block.get("align_x", "center") or "center")
-    align_y = str(block.get("align_y", "center") or "center")
-    photo_enhance = bool(block.get("photo_enhance", False))
-    margin_bottom = int(block.get("margin_bottom", 6) * ctx.scale)
     # Try pre-fetched data first (async download from json_content.py)
     prefetched = ctx.content.get(f"_prefetched_{field_name}")
     if prefetched:
         from io import BytesIO
-        img = convert_image_block(
-            Image.open(BytesIO(prefetched)),
-            width,
-            height,
-            ctx.colors,
-            fit=fit,
-            align_x=align_x,
-            align_y=align_y,
-            photo_enhance=photo_enhance,
-        )
-        if ctx.colors >= 3:
-            ctx.img.paste(img, (x, y))
-        else:
-            ctx.paste_icon(img, (x, y))
-        ctx.y = y + height + margin_bottom
+        _paste_image_block(ctx, block, Image.open(BytesIO(prefetched)))
         return
     local_path = _resolve_local_asset(image_url)
     if local_path:
         try:
-            img = convert_image_block(
-                Image.open(local_path),
-                width,
-                height,
-                ctx.colors,
-                fit=fit,
-                align_x=align_x,
-                align_y=align_y,
-                photo_enhance=photo_enhance,
-            )
-            if ctx.colors >= 3:
-                ctx.img.paste(img, (x, y))
-            else:
-                ctx.paste_icon(img, (x, y))
-            ctx.y = y + height + margin_bottom
+            _paste_image_block(ctx, block, Image.open(local_path))
             return
         except (OSError, UnidentifiedImageError):
             logger.warning("[JSONRenderer] Failed to load local asset %s", local_path, exc_info=True)
     elif _is_upload_url(image_url):
         logger.warning("[JSONRenderer] Uploaded image link expired: %s", image_url)
+        x, y, width, height = _image_block_box(ctx, block)
         _draw_image_placeholder(ctx, x, y, width, height, "Image link expired")
-        ctx.y = y + height + margin_bottom
+        ctx.y = y + height + int(block.get("margin_bottom", 6) * ctx.scale)
         return
     try:
         resp = None
@@ -2621,23 +2560,10 @@ def _render_image(ctx: RenderContext, block: dict) -> None:
         if resp is None:
             raise last_error if last_error else ValueError("image fetch failed")
         from io import BytesIO
-        img = convert_image_block(
-            Image.open(BytesIO(resp.content)),
-            width,
-            height,
-            ctx.colors,
-            fit=fit,
-            align_x=align_x,
-            align_y=align_y,
-            photo_enhance=photo_enhance,
-        )
-        if ctx.colors >= 3:
-            ctx.img.paste(img, (x, y))
-        else:
-            ctx.paste_icon(img, (x, y))
-        ctx.y = y + height + margin_bottom
+        _paste_image_block(ctx, block, Image.open(BytesIO(resp.content)))
     except (httpx.HTTPError, ValueError, OSError, UnidentifiedImageError):
         logger.warning("[JSONRenderer] Failed to render image block: %s", image_url, exc_info=True)
+        x, y, width, height = _image_block_box(ctx, block)
         _draw_image_placeholder(ctx, x, y, width, height, "Image link expired")
         ctx.y = y + height + int(block.get("margin_bottom", 6) * ctx.scale)
 

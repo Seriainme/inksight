@@ -2,6 +2,7 @@
 测试 JSON 渲染引擎
 验证各种布局原语能正确渲染到 1-bit e-ink 图像
 """
+import json
 import os
 import sys
 from io import BytesIO
@@ -64,6 +65,7 @@ def test_render_list_wraps_to_multiple_lines():
             "margin_x": 24,
         },
     ])
+    mode_def["layout"]["body_align"] = "top"
     content = {
         "items": [
             {
@@ -676,6 +678,53 @@ def test_render_image_block_cover_fit_fills_frame():
     assert img.getpixel((119, 99)) == 255
 
 
+def test_image_block_matches_source_orientation():
+    def _render(size, **kwargs):
+        src = Image.new("RGB", size, "black")
+        buf = BytesIO()
+        src.save(buf, format="PNG")
+        mode_def = _make_mode_def([{
+            "type": "image",
+            "field": "image_url",
+            "width": 120,
+            "height": 60,
+            "fit": "fill",
+            "match_orientation": True,
+            "margin_bottom": 0,
+        }])
+        mode_def["layout"]["body_align"] = "top"
+        return render_json_mode(
+            mode_def,
+            {"image_url": "prefetched://art", "_prefetched_image_url": buf.getvalue()},
+            date_str="", weather_str="", battery_pct=80,
+            **kwargs,
+        ).convert("L")
+
+    portrait = _render((40, 80))
+    assert portrait.getpixel((170, 0)) < 255
+    assert portrait.getpixel((169, 0)) == 255
+    assert portrait.getpixel((200, 119)) < 255
+    assert portrait.getpixel((200, 120)) == 255
+
+    landscape = _render((80, 40))
+    assert landscape.getpixel((140, 0)) < 255
+    assert landscape.getpixel((200, 59)) < 255
+    assert landscape.getpixel((200, 60)) == 255
+
+    # Swapped box is taller than the screen, so the landscape frame stays.
+    cramped = _render((40, 80), screen_w=200, screen_h=80)
+    assert cramped.getpixel((50, 54)) < 255
+    assert cramped.getpixel((50, 55)) == 255
+
+
+def test_artwall_layout_has_no_title():
+    path = os.path.join(os.path.dirname(__file__), "..", "core", "modes", "builtin", "artwall.json")
+    with open(path, encoding="utf-8") as fh:
+        mode = json.load(fh)
+    assert [block["type"] for block in mode["layout"]["body"]] == ["image"]
+    assert mode["layout"]["body"][0]["match_orientation"] is True
+
+
 def test_render_missing_uploaded_image_does_not_fetch_remote():
     mode_def = _make_mode_def([
         {"type": "image", "field": "image_url", "width": 120, "height": 36, "x": 100, "y": 80}
@@ -793,6 +842,24 @@ def test_render_timetable_grid_supports_custom_fields():
         date_str="2月18日", weather_str="晴", battery_pct=80,
     ).convert("L")
     assert min(img.crop((10, 34, SCREEN_W - 10, 110)).getdata()) < 255
+
+
+def test_render_omits_status_bar_and_footer():
+    mode_def = _make_mode_def([
+        {"type": "centered_text", "field": "text", "font_size": 16},
+    ])
+    img = render_json_mode(
+        mode_def,
+        {"text": "Hi"},
+        date_str="2月18日",
+        weather_str="晴",
+        battery_pct=80,
+    ).convert("L")
+    # Former status-bar rule (y=36) and footer rule stay blank.
+    assert img.getpixel((0, 36)) == 255
+    assert img.getpixel((SCREEN_W // 2, 36)) == 255
+    assert img.getpixel((0, SCREEN_H - 30)) == 255
+    assert img.getpixel((SCREEN_W - 1, 8)) == 255
 
 
 def test_builtin_footer_localization():
